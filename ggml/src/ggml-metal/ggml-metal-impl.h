@@ -8,6 +8,9 @@
 //
 // TODO: for optimal performance, become function of the device and work size
 
+#define N_R0_Q1_0 8
+#define N_SG_Q1_0 2
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
 
@@ -68,6 +71,12 @@
 #define N_R0_IQ4_XS 2
 #define N_SG_IQ4_XS 2
 
+#define N_R0_TQ3_1S 8
+#define N_SG_TQ3_1S 2
+
+#define N_R0_TQ4_1S 8
+#define N_SG_TQ4_1S 2
+
 // function constants offsets
 #define FC_FLASH_ATTN_EXT_PAD          100
 #define FC_FLASH_ATTN_EXT_BLK          200
@@ -86,6 +95,8 @@
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
 #define FC_TURBO_WHT                   1700
+#define FC_TURBO_FLASH_P1              1800
+#define FC_TURBO_FLASH_P2              1900
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -121,6 +132,11 @@
 #define OP_UNARY_NUM_EXP         114
 #define OP_UNARY_NUM_SOFTPLUS    115
 #define OP_UNARY_NUM_EXPM1       116
+#define OP_UNARY_NUM_FLOOR       117
+#define OP_UNARY_NUM_CEIL        118
+#define OP_UNARY_NUM_ROUND       119
+#define OP_UNARY_NUM_TRUNC       120
+#define OP_UNARY_NUM_XIELU       121
 
 #define OP_SUM_ROWS_NUM_SUM_ROWS 10
 #define OP_SUM_ROWS_NUM_MEAN     11
@@ -409,6 +425,40 @@ typedef struct {
     float    logit_softcap;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
+// TurboFlash two-pass: asymmetric K=q8_0, V=turbo3 fused attention
+// Pass 1 args (block scoring + partial V accumulation)
+typedef struct {
+    int32_t  ne01;      // number of query heads (batch dim 1)
+    int32_t  ne02;      // number of query heads (batch dim 2)
+    int32_t  ne03;      // number of query heads (batch dim 3)
+    uint64_t nb01;      // Q row stride
+    uint64_t nb02;      // Q head stride
+    uint64_t nb03;      // Q batch stride
+    int32_t  ne11;      // KV sequence length (T_kv)
+    int32_t  ne_12_2;   // KV head count dim 2
+    int32_t  ne_12_3;   // KV head count dim 3
+    uint64_t nb11;      // K row stride (bytes per KV token in K)
+    uint64_t nb12;      // K head stride
+    uint64_t nb13;      // K batch stride
+    uint64_t nb21;      // V row stride (bytes per KV token in V)
+    uint64_t nb22;      // V head stride
+    uint64_t nb23;      // V batch stride
+    int32_t  ne31;      // mask dim 1
+    int32_t  ne32;      // mask dim 2
+    int32_t  ne33;      // mask dim 3
+    uint64_t nb31;      // mask stride 1
+    uint64_t nb32;      // mask stride 2
+    uint64_t nb33;      // mask stride 3
+    float    scale;     // attention scale (1/sqrt(dk))
+    int32_t  n_blocks;  // ceil(ne11 / BLOCK_SIZE)
+} ggml_metal_kargs_turbo_flash_p1;
+
+// Pass 2 args (merge partials + inverse WHT + write output)
+typedef struct {
+    int32_t  ne01;      // number of query heads (total n_bh)
+    int32_t  n_blocks;  // number of blocks from pass 1
+} ggml_metal_kargs_turbo_flash_p2;
+
 typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
@@ -644,6 +694,42 @@ typedef struct {
     int32_t  KHW; // KH * KW, pre-computed on CPU to save GPU resources
 } ggml_metal_kargs_im2col;
 
+typedef struct {
+    int32_t  IW;
+    int32_t  IH;
+    int32_t  ID;
+    int32_t  OW;
+    int32_t  OH;
+    int32_t  OD;
+    int32_t  KW;
+    int32_t  KH;
+    int32_t  KD;
+    int32_t  s0;
+    int32_t  s1;
+    int32_t  s2;
+    int32_t  p0;
+    int32_t  p1;
+    int32_t  p2;
+    int32_t  d0;
+    int32_t  d1;
+    int32_t  d2;
+    int32_t  IC;
+    int32_t  N;
+    int32_t  OC;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_conv_3d;
+
 typedef struct{
     int32_t  ne00;
     uint64_t nb01;
@@ -831,6 +917,7 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  keep_intermediates;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
