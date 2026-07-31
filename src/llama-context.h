@@ -5,15 +5,26 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
-
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <vector>
 
 struct llama_model;
 class llama_batch_allocr;
+
+struct llama_context;
+
+// Qwen NextN: non-owning draft context for paired KV seq_rm (drafting uses embeddings_pre_norm buffers).
+struct llama_nextn {
+    llama_context * ctx_nextn = nullptr;
+};
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -79,6 +90,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    float * get_embeddings_pre_norm();
+    float * get_embeddings_pre_norm_ith(int32_t i);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -102,6 +116,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_embeddings_pre_norm(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -124,10 +139,70 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                           bool     apply_mctx = true);
+
+    llm_graph_params graph_params_mtp(
+            llm_graph_result * res,
+            const llama_ubatch & ubatch,
+            const llama_memory_context_i * mctx) const;
+
+    // Gemma4 MTP: greedy multi-step draft using nested gemma4_assistant + target KV (seq_id / attn_pos for masks).
+    // Synchronous facade: equivalent to decode_mtp_async() immediately followed by decode_mtp_wait().
+    // Kept for backward compatibility with existing callers.
+    int32_t decode_mtp(
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
+
+    // Async MTP draft pipeline (see plan async-mtp-pipeline). Submits the request to a
+    // dedicated worker thread that runs the MTP graph on its own ggml_backend_sched
+    // (sched_mtp), allowing CPU-side encoding to overlap with target verify.
+    //
+    // Contract:
+    //   - At most one in-flight request per context. Calling _async while a previous
+    //     request is unwaited returns an error.
+    //   - Caller must ensure target KV positions ≤ attn_pos remain stable until _wait
+    //     returns (KV cache is append-only in current model architectures).
+    int32_t decode_mtp_async(
+            llama_seq_id  seq_id,
+            llama_pos     attn_pos,
+            llama_token   last_token,
+            const float * h_prev,
+            int32_t       n_steps);
+
+    // Block until the in-flight MTP request completes. Copies drafts into out_drafts
+    // and the last hidden state into out_h_prev_last (optional). Returns 0 on success.
+    int32_t decode_mtp_wait(
+            llama_token * out_drafts,
+            float       * out_h_prev_last);
+
+    // In-thread synchronous MTP path used as a fallback when out_logits != NULL
+    // (the async worker contract does not stream per-step logits).
+    int32_t decode_mtp_sync(
+            llama_seq_id seq_id,
+            llama_pos attn_pos,
+            llama_token last_token,
+            float * h_prev,
+            int32_t n_steps,
+            llama_token * out_drafts,
+            float * out_logits,
+            float * out_h_prev_last);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // Qwen NextN: secondary draft context (same GGUF as target; separate ctx). Used for paired KV seq_rm.
+    void set_nextn(llama_context * ctx_nextn_in);
+
+    llama_context * get_nextn() const {
+        return nextn.ctx_nextn;
+    }
 
     //
     // state save/load
@@ -272,6 +347,8 @@ private:
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
 
+    buffer_view<float> embd_pre_norm = {nullptr, 0};
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -334,6 +411,62 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    llama_nextn nextn;
+
+    // Async MTP pipeline (Phase C of async-mtp-pipeline plan).
+    // sched_mtp is a dedicated scheduler so the MTP draft graph can be encoded on a
+    // worker thread without contending with the target's sched. gf_res_prev_mtp keeps
+    // its own graph cache so reuse across MTP steps survives target decode calls.
+    ggml_backend_sched_ptr sched_mtp;
+    llm_graph_result_ptr   gf_res_prev_mtp;
+
+    struct mtp_request {
+        llama_seq_id       seq_id   = 0;
+        llama_pos          attn_pos = 0;
+        llama_token        last_token = 0;
+        std::vector<float> h_prev;
+        int32_t            n_steps  = 0;
+    };
+
+    struct mtp_response {
+        int32_t                  status      = 0;
+        std::vector<llama_token> drafts;
+        std::vector<float>       h_prev_last;
+    };
+
+    std::thread             mtp_worker;
+    std::atomic<bool>       mtp_worker_stop{false};
+    std::mutex              mtp_mu;
+    std::condition_variable mtp_cv_request;
+    std::condition_variable mtp_cv_response;
+    std::optional<mtp_request>  mtp_pending;   // submitted, not yet picked up by worker
+    bool                        mtp_in_flight = false; // worker is processing
+    std::optional<mtp_response> mtp_completed; // worker finished, awaiting _wait
+
+    // Serializes shared-backend reconfiguration (set_threadpool_fn, set_n_threads_fns)
+    // between the main thread (graph_compute) and the MTP worker (graph_compute_mtp).
+    // Currently the depth-1 sync-wrapper integration in speculative.cpp does not run
+    // them concurrently, but this guard is required for any future pipeline-depth-2
+    // or multi-worker variant where target encode and MTP encode actually overlap.
+    std::mutex backend_cfg_mu;
+
+    // Lazily create sched_mtp and reserve its compute buffers on the first MTP call.
+    bool ensure_sched_mtp();
+
+    // Run the MTP graph for one ubatch on sched_mtp / gf_res_prev_mtp. Mirrors
+    // process_ubatch() but is fully isolated from the target sched.
+    llm_graph_result * process_ubatch_mtp(
+                const llama_ubatch & ubatch,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
+    ggml_status graph_compute_mtp(ggml_cgraph * gf);
+
+    // Worker-side execution of one mtp_request (sequential N-step loop on sched_mtp).
+    int32_t decode_mtp_run(const mtp_request & req, mtp_response & resp);
+
+    void mtp_worker_loop();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

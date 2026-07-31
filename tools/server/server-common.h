@@ -189,6 +189,10 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const llama_tokens & get_text_tokens() const;
 
+    // Replace LLAMA_TOKEN_NULL (mtmd media placeholders) for callers that need a flat token stream
+    // (e.g. Qwen NextN speculative begin / prime). Text tokens are unchanged.
+    llama_tokens replace_media_null_tokens(llama_token replacement) const;
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 
@@ -304,6 +308,12 @@ json oaicompat_chat_params_parse(
 
 // convert OpenAI Responses API format to OpenAI Chat Completions API format
 json convert_responses_to_chatcmpl(const json & body);
+
+// convert OpenAI transcriptions API format to OpenAI Chat Completions API format
+json convert_transcriptions_to_chatcmpl(
+    const json & body,
+    const std::map<std::string, raw_buffer> & in_files,
+    std::vector<raw_buffer> & out_files);
 
 // convert Anthropic Messages API format to OpenAI Chat Completions API format
 json convert_anthropic_to_oai(const json & body);
