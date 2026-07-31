@@ -153,6 +153,12 @@ class Keys:
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
 
+        N_CENTROIDS                       = "{arch}.n_centroids"
+        CENTROID_TOP_K                    = "{arch}.centroid_top_k"
+        N_EMBD_BACKBONE                   = "{arch}.n_embd_backbone"
+        USE_ORDERED_EMBEDDINGS            = "{arch}.use_ordered_embeddings"
+        REQUIRES_TARGET_ARCH              = "{arch}.requires_target_arch"
+
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
         HEAD_COUNT_KV                = "{arch}.attention.head_count_kv"
@@ -181,6 +187,7 @@ class Keys:
         KEY_LENGTH_SWA               = "{arch}.attention.key_length_swa"
         VALUE_LENGTH_SWA             = "{arch}.attention.value_length_swa"
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
+        K_EQ_V                       = "{arch}.attention.k_eq_v"
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
 
@@ -420,6 +427,7 @@ class MODEL_ARCH(IntEnum):
     GEMMA3           = auto()
     GEMMA3N          = auto()
     GEMMA4           = auto()
+    GEMMA4_ASSISTANT = auto()
     GEMMA_EMBEDDING  = auto()
     STARCODER2       = auto()
     RWKV6            = auto()
@@ -506,6 +514,7 @@ class VISION_PROJECTOR_TYPE(IntEnum):
     GEMMA3N   = auto()
     GEMMA3    = auto()
     QWEN3VL   = auto()
+    STEP3VL   = auto()
     COGVLM    = auto()
 
 
@@ -734,6 +743,7 @@ class MODEL_TENSOR(IntEnum):
     V_LAYER_OUT_SCALE    = auto()
     V_PRE_NORM           = auto()
     V_POST_NORM          = auto()
+    V_MM_PRE_NORM        = auto() # hunyuanocr
     V_MM_POST_NORM       = auto()
     V_MM_INP_NORM        = auto()
     V_MM_INP_PROJ        = auto() # gemma3
@@ -769,6 +779,8 @@ class MODEL_TENSOR(IntEnum):
     V_MM_GATE            = auto() # cogvlm
     V_TOK_BOI            = auto() # cogvlm
     V_TOK_EOI            = auto() # cogvlm
+    V_TOK_IMG_BEGIN      = auto() # hunyuanocr
+    V_TOK_IMG_END        = auto() # hunyuanocr
     V_STD_BIAS           = auto() # gemma4
     V_STD_SCALE          = auto() # gemma4
     V_SAM_POS_EMBD       = auto() # Deepseek-OCR
@@ -794,6 +806,8 @@ class MODEL_TENSOR(IntEnum):
     A_ENC_INP_PROJ        = auto() # gemma4
     A_ENC_CONV1D          = auto()
     A_ENC_CONV1D_NORM     = auto() # gemma3n
+    A_ENC_CONV2D          = auto()
+    A_ENC_CONV_OUT        = auto()
     A_PRE_NORM            = auto()
     A_POST_NORM           = auto()
     A_ENC_LAYER_PRE_NORM  = auto() # gemma3n
@@ -836,6 +850,11 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HNORM          = auto()
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
+    # Gemma 4 MTP assistant (GGUF names: mtp.*)
+    MTP_PRE_PROJECTION     = auto()
+    MTP_POST_PROJECTION    = auto()
+    MTP_CENTROIDS          = auto()
+    MTP_TOKEN_ORDERING     = auto()
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -899,6 +918,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GEMMA3:           "gemma3",
     MODEL_ARCH.GEMMA3N:          "gemma3n",
     MODEL_ARCH.GEMMA4:           "gemma4",
+    MODEL_ARCH.GEMMA4_ASSISTANT: "gemma4_assistant",
     MODEL_ARCH.GEMMA_EMBEDDING:  "gemma-embedding",
     MODEL_ARCH.STARCODER2:       "starcoder2",
     MODEL_ARCH.RWKV6:            "rwkv6",
@@ -984,6 +1004,8 @@ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
     VISION_PROJECTOR_TYPE.GLM_EDGE:  "adapter",
     VISION_PROJECTOR_TYPE.MERGER:    "qwen2vl_merger",
     VISION_PROJECTOR_TYPE.GEMMA3:    "gemma3",
+    VISION_PROJECTOR_TYPE.QWEN3VL:   "qwen3vl_merger",
+    VISION_PROJECTOR_TYPE.STEP3VL:   "step3vl",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -1246,6 +1268,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_MM_GATE:                 "mm.gate",
     MODEL_TENSOR.V_TOK_BOI:                 "v.boi",
     MODEL_TENSOR.V_TOK_EOI:                 "v.eoi",
+    MODEL_TENSOR.V_MM_PRE_NORM:             "mm.pre_norm",
+    MODEL_TENSOR.V_TOK_IMG_BEGIN:           "mm.image_begin",
+    MODEL_TENSOR.V_TOK_IMG_END:             "mm.image_end",
     MODEL_TENSOR.V_STD_BIAS:                "v.std_bias", # gemma4
     MODEL_TENSOR.V_STD_SCALE:               "v.std_scale", # gemma4
     # DeepSeek-OCR SAM
@@ -1271,6 +1296,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS:      "a.embd_to_logits",
     MODEL_TENSOR.A_ENC_INP_PROJ:            "a.input_projection",
     MODEL_TENSOR.A_ENC_CONV1D:              "a.conv1d.{bid}",
+    MODEL_TENSOR.A_ENC_CONV2D:              "a.conv2d.{bid}",
+    MODEL_TENSOR.A_ENC_CONV_OUT:            "a.conv_out",
     MODEL_TENSOR.A_ENC_CONV1D_NORM:         "a.conv1d.{bid}.norm",
     MODEL_TENSOR.A_PRE_NORM:                "a.pre_ln",
     MODEL_TENSOR.A_POST_NORM:               "a.post_ln",
@@ -1324,6 +1351,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+    MODEL_TENSOR.MTP_PRE_PROJECTION:        "mtp.pre_projection",
+    MODEL_TENSOR.MTP_POST_PROJECTION:       "mtp.post_projection",
+    MODEL_TENSOR.MTP_CENTROIDS:             "mtp.centroids",
+    MODEL_TENSOR.MTP_TOKEN_ORDERING:        "mtp.token_ordering",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -1393,6 +1424,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_MM_GATE,
         MODEL_TENSOR.V_TOK_BOI,
         MODEL_TENSOR.V_TOK_EOI,
+        MODEL_TENSOR.V_MM_PRE_NORM,
+        MODEL_TENSOR.V_TOK_IMG_BEGIN,
+        MODEL_TENSOR.V_TOK_IMG_END,
         MODEL_TENSOR.V_STD_BIAS,
         MODEL_TENSOR.V_STD_SCALE,
         MODEL_TENSOR.V_SAM_POS_EMBD,
@@ -1414,6 +1448,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS,
         MODEL_TENSOR.A_ENC_INP_PROJ,
         MODEL_TENSOR.A_ENC_CONV1D,
+        MODEL_TENSOR.A_ENC_CONV2D,
+        MODEL_TENSOR.A_ENC_CONV_OUT,
         MODEL_TENSOR.A_ENC_CONV1D_NORM,
         MODEL_TENSOR.A_PRE_NORM,
         MODEL_TENSOR.A_POST_NORM,
@@ -2347,6 +2383,26 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PER_LAYER_PROJ,
         MODEL_TENSOR.PER_LAYER_PROJ_NORM,
         MODEL_TENSOR.PER_LAYER_POST_NORM,
+    ],
+    MODEL_ARCH.GEMMA4_ASSISTANT: [
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.MTP_PRE_PROJECTION,
+        MODEL_TENSOR.MTP_POST_PROJECTION,
+        MODEL_TENSOR.MTP_CENTROIDS,
+        MODEL_TENSOR.MTP_TOKEN_ORDERING,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.FFN_PRE_NORM,
+        MODEL_TENSOR.FFN_POST_NORM,
+        MODEL_TENSOR.LAYER_OUT_SCALE,
     ],
     MODEL_ARCH.GEMMA_EMBEDDING: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -3987,6 +4043,9 @@ class GGMLQuantizationType(IntEnum):
     TQ2_0   = 35
     MXFP4   = 39
     NVFP4   = 40
+    Q1_0    = 41
+    TQ3_1S  = 45
+    TQ4_1S  = 46
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4040,6 +4099,9 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
     MOSTLY_NVFP4         = 39  # except 1d tensors
+    MOSTLY_Q1_0          = 40  # except 1d tensors
+    MOSTLY_TQ3_1S        = 43  # except 1d tensors
+    MOSTLY_TQ4_1S        = 44  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -4094,12 +4156,15 @@ class VisionProjectorType:
     QWEN2VL = "qwen2vl_merger"
     QWEN25VL = "qwen2.5vl_merger"
     QWEN3VL = "qwen3vl_merger"
+    STEP3VL = "step3vl"
     ULTRAVOX = "ultravox"
     INTERNVL = "internvl"
     QWEN2A = "qwen2a" # audio
+    QWEN3A = "qwen3a" # audio
     GLMA = "glma" # audio
     QWEN25O = "qwen2.5o" # omni
     VOXTRAL = "voxtral"
+    MERALION = "meralion"  # audio: Whisper + gated MLP adaptor
     LFM2 = "lfm2"
     KIMIVL = "kimivl"
     PADDLEOCR = "paddleocr"
@@ -4107,12 +4172,14 @@ class VisionProjectorType:
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"
     JANUS_PRO = "janus_pro"
+    DOTSOCR = "dots_ocr"
     DEEPSEEKOCR = "deepseekocr"
     LFM2A = "lfm2a" # audio
     MUSIC_FLAMINGO = "musicflamingo" # audio
     GLM4V = "glm4v"
     YOUTUVL = "youtuvl"
     NEMOTRON_V2_VL = "nemotron_v2_vl"
+    HUNYUANOCR     = "hunyuanocr"
 
 
 # Items here are (block size, type size)
@@ -4151,6 +4218,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TQ2_0:   (256, 2 + 64),
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+    GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+    GGMLQuantizationType.TQ3_1S:  (32, 2 + 2 + 12),
+    GGMLQuantizationType.TQ4_1S:  (32, 2 + 2 + 16),
 }
 
 

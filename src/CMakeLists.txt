@@ -74,6 +74,7 @@ add_library(llama
             models/gemma3.cpp
             models/gemma3n-iswa.cpp
             models/gemma4-iswa.cpp
+            models/gemma4-assistant.cpp
             models/glm4-moe.cpp
             models/glm4.cpp
             models/gpt2.cpp
@@ -126,7 +127,9 @@ add_library(llama
             models/qwen2vl.cpp
             models/qwen3.cpp
             models/qwen35.cpp
+            models/qwen35-nextn.cpp
             models/qwen35moe.cpp
+            models/qwen35moe-nextn.cpp
             models/qwen3moe.cpp
             models/qwen3next.cpp
             models/qwen3vl-moe.cpp
