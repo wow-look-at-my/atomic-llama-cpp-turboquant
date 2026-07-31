@@ -15,8 +15,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 #include <exception>
 #include <memory>
+#include <sstream>
 #include <filesystem>
 
 // fix problem with std::min and std::max
@@ -29,6 +33,34 @@
 #endif
 
 using json = nlohmann::ordered_json;
+
+namespace {
+
+// Token used to replace LLAMA_TOKEN_NULL placeholders when priming Qwen NextN draft KV (see common_speculative_begin).
+static llama_token server_nextn_mtmd_fill_token(const llama_model * model) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (!vocab) {
+        return 0;
+    }
+    static const char * const k_candidates[] = {
+        "<|image_pad|>",
+        "<|IMAGE_PAD|>",
+        "<|vision_pad|>",
+    };
+    std::vector<llama_token> buf(32);
+    for (const char * piece : k_candidates) {
+        const int32_t n = llama_tokenize(
+                vocab, piece, (int32_t) std::strlen(piece),
+                buf.data(), (int32_t) buf.size(), false, true);
+        if (n == 1) {
+            return buf[0];
+        }
+    }
+    const llama_token pad = llama_vocab_pad(vocab);
+    return pad != LLAMA_TOKEN_NULL ? pad : 0;
+}
+
+} // namespace
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -55,6 +87,9 @@ struct server_slot {
 
     // multimodal
     mtmd_context * mctx = nullptr;
+
+    // seq_rm capability for speculative checkpoints / GDN rollback (see common_context_can_seq_rm)
+    common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative * spec = nullptr;
 
@@ -134,7 +169,7 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        llama_context_nextn_seq_rm(ctx, id, -1, -1);
         prompt.tokens.clear();
     }
 
@@ -155,8 +190,8 @@ struct server_slot {
     int64_t t_start_process_prompt;
     int64_t t_start_generation;
 
-    double t_prompt_processing; // ms
-    double t_token_generation;  // ms
+    double t_prompt_processing = 0.0; // ms
+    double t_token_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
 
@@ -438,7 +473,7 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        llama_memory_seq_rm(llama_get_memory(ctx), other.id,     -1, -1);
+        llama_context_nextn_seq_rm(ctx, other.id, -1, -1);
         llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
 
         other.n_decoded   = n_decoded;
@@ -605,6 +640,17 @@ private:
         llama_batch_free(batch);
     }
 
+    void slot_save_and_clear(server_slot & slot) {
+        if (slot.prompt.n_tokens() == 0) {
+            return;
+        }
+        SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
+        SLT_DBG(slot, "%s", "__TEST_TAG_CLEAR_IDLE_SLOT__\n");
+        slot.prompt_save(*prompt_cache);
+        slot.prompt_clear(false);
+        prompt_cache->update();
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -621,7 +667,7 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
-    bool load_model(const common_params & params) {
+    bool load_model(common_params & params) {
         bool is_resume = sleeping;
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
@@ -629,6 +675,9 @@ private:
         params_base = params;
 
         llama_init = common_init_from_params(params_base);
+
+        // propagate model-metadata sampling defaults back to caller
+        params.sampling = params_base.sampling;
 
         model = llama_init->model();
         ctx   = llama_init->context();
@@ -645,38 +694,126 @@ private:
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (params_base.speculative.has_dft()) {
-            SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
-
             const auto & params_spec = params_base.speculative;
 
-            auto params_dft = params_base;
+            if (params_spec.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                // MTP assistant is loaded into the target in common_init_from_params (llama_model_load_mtp_from_file).
+                SRV_INF("MTP assistant path '%s' (loaded into target model)\n", params_spec.mparams_dft.path.c_str());
+                params_base.speculative.model_dft = nullptr;
+            } else if (params_spec.type == COMMON_SPECULATIVE_TYPE_NEXTN) {
+                // NextN draft path. Two backends:
+                //
+                //   (a) Shared-model path (default, no second mmap): target was loaded from a
+                //       combined *_MTP GGUF (hparams.nextn_predict_layers > 0). The NextN-layer
+                //       tensors physically live in the target model's tensor table already, so
+                //       we DON'T allocate a second llama_model — we just spin up a second
+                //       llama_context on top of the same llama_model with cparams.nextn_draft=true,
+                //       which routes build_graph() to the qwen35*_nextn builder. KV cache is sized
+                //       only for the target model's non-recurrent layers (small) and is per-context,
+                //       so the two contexts never share KV state. This eliminates the previous
+                //       ~22 GB second mmap (kIOGPUCommandBufferCallbackErrorOutOfMemory on M-series).
+                //
+                //   (b) Standalone NEXTN_ONLY GGUF (legacy): user passes a small extracted GGUF
+                //       (general.architecture = 'qwen35_mtp' / 'qwen35moe_mtp') as --model-draft.
+                //       In that case we fall back to the old second-model load — but without any
+                //       override_arch (the file's own arch is already correct). Only useful when
+                //       the user wants to ship the draft head as a separate artifact.
+                const bool target_has_nextn = llama_model_has_nextn_layer(model);
+                const bool draft_is_same_file =
+                        params_spec.mparams_dft.path == params_base.model.path;
 
-            params_dft.n_parallel   = 1;
-            params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
-            params_dft.n_batch      = llama_n_ctx_seq(ctx);
-            params_dft.devices      = params_spec.devices;
-            params_dft.model        = params_spec.mparams_dft;
-            params_dft.n_gpu_layers = params_spec.n_gpu_layers;
-            params_dft.cache_type_k = params_spec.cache_type_k;
-            params_dft.cache_type_v = params_spec.cache_type_v;
+                if (target_has_nextn && draft_is_same_file) {
+                    SRV_INF("NextN draft: shared-model path (target %s, no second mmap; nextn_predict_layers=%u)\n",
+                            llama_model_arch_str(model),
+                            (unsigned) llama_model_n_nextn_predict_layers(model));
 
-            if (params_spec.cpuparams.n_threads > 0) {
-                params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
-                params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    auto params_dft = params_base;
+                    params_dft.n_parallel   = 1;
+                    params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                    params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                    params_dft.cache_type_k = params_spec.cache_type_k;
+                    params_dft.cache_type_v = params_spec.cache_type_v;
+                    if (params_spec.cpuparams.n_threads > 0) {
+                        params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                        params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    }
+
+                    auto cparams_dft = common_context_params_to_llama(params_dft);
+                    cparams_dft.nextn_draft = true;
+                    cparams_dft.n_rs_seq    = 0;
+
+                    params_base.speculative.model_dft   = model;
+                    params_base.speculative.cparams_dft = cparams_dft;
+                } else {
+                    if (target_has_nextn) {
+                        SRV_INF("NextN draft: standalone GGUF '%s' (target has NextN but user pointed --model-draft at a separate file)\n",
+                                params_spec.mparams_dft.path.c_str());
+                    } else {
+                        SRV_INF("NextN draft: standalone GGUF '%s' (target arch=%s has no NextN tensors; loading second model)\n",
+                                params_spec.mparams_dft.path.c_str(),
+                                llama_model_arch_str(model));
+                    }
+
+                    auto params_dft = params_base;
+                    params_dft.n_parallel   = 1;
+                    params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                    params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                    params_dft.devices      = params_spec.devices;
+                    params_dft.model        = params_spec.mparams_dft;
+                    params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+                    params_dft.cache_type_k = params_spec.cache_type_k;
+                    params_dft.cache_type_v = params_spec.cache_type_v;
+                    if (params_spec.cpuparams.n_threads > 0) {
+                        params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                        params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                    }
+                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+                    auto mparams_dft = common_model_params_to_llama(params_dft);
+                    model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+                    if (model_dft == nullptr) {
+                        SRV_ERR("failed to load NextN draft model, '%s'\n", params_dft.model.path.c_str());
+                        return false;
+                    }
+
+                    params_base.speculative.model_dft   = model_dft.get();
+                    params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                    params_base.speculative.cparams_dft.n_rs_seq = 0;
+                }
+            } else {
+                SRV_INF("loading draft model '%s'\n", params_base.speculative.mparams_dft.path.c_str());
+
+                auto params_dft = params_base;
+
+                params_dft.n_parallel   = 1;
+                params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx) : params_spec.n_ctx;
+                params_dft.n_batch      = llama_n_ctx_seq(ctx);
+                params_dft.devices      = params_spec.devices;
+                params_dft.model        = params_spec.mparams_dft;
+                params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+                params_dft.cache_type_k = params_spec.cache_type_k;
+                params_dft.cache_type_v = params_spec.cache_type_v;
+
+                if (params_spec.cpuparams.n_threads > 0) {
+                    params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                    params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                }
+
+                params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+                auto mparams_dft = common_model_params_to_llama(params_dft);
+
+                model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+                if (model_dft == nullptr) {
+                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+
+                params_base.speculative.model_dft = model_dft.get();
+                params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+                // draft context does not need recurrent rollback snapshots (target owns n_rs_seq)
+                params_base.speculative.cparams_dft.n_rs_seq = 0;
             }
-
-            params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-
-            auto mparams_dft = common_model_params_to_llama(params_dft);
-
-            model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
-            if (model_dft == nullptr) {
-                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-                return false;
-            }
-
-            params_base.speculative.model_dft = model_dft.get();
-            params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
         }
 
         std::string & mmproj_path = params_base.mmproj.path;
@@ -712,9 +849,10 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type =  COMMON_SPECULATIVE_TYPE_NONE;
-                SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
+            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
+                    !common_speculative_is_mtmd_safe(params_base.speculative.type)) {
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+                SRV_WRN("%s\n", "speculative decoding with this type is not supported by multimodal, it will be disabled");
             }
         }
 
@@ -747,8 +885,8 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
+            // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
         }
 
         slots.clear();
@@ -756,6 +894,11 @@ private:
         const bool can_spec = common_speculative_is_compat(ctx);
         if (!can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
+        }
+
+        const common_context_seq_rm_type ctx_seq_rm_global = common_context_can_seq_rm(ctx);
+        if (ctx_seq_rm_global == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+            SRV_WRN("%s", "speculative decoding may use checkpoints (full sequence removal only)\n");
         }
 
         // initialize slots
@@ -766,6 +909,8 @@ private:
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
 
+            slot.ctx_seq_rm_type = ctx_seq_rm_global;
+
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
@@ -773,14 +918,17 @@ private:
             if (can_spec) {
                 slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
                 if (slot.spec) {
-                    if (mctx) {
-                        SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
+                    if (mctx && !common_speculative_all_impls_mtmd_safe(slot.spec)) {
+                        SRV_ERR("%s\n", "speculative decoding with this type is not supported with multimodal");
                         return false;
                     }
+                    // MTP reads target's KV memory by sequence id; bind to slot.id (server uses slot.id as seq_id).
+                    common_speculative_set_seq_id(slot.spec, slot.id);
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
                 } else {
                     SLT_INF(slot, "%s", "speculative decoding context not initialized\n");
                 }
+            } else {
             }
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
@@ -863,6 +1011,19 @@ private:
         });
 
         metrics.init();
+
+        if (params_base.clear_idle) {
+            if (!params_base.kv_unified) {
+                SRV_WRN("%s: --clear-idle requires --kv-unified, disabling\n", __func__);
+                params_base.clear_idle = false;
+            } else if (params_base.cache_ram_mib == 0) {
+                SRV_WRN("%s: --clear-idle requires --cache-ram, disabling\n", __func__);
+                params_base.clear_idle = false;
+            } else {
+                SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
+                SRV_DBG("%s", "__TEST_TAG_CLEAR_IDLE_ENABLED__\n");
+            }
+        }
 
         // populate webui settings
         {
@@ -1010,15 +1171,15 @@ private:
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
-            // don't update the cache if the slot's context is empty
-            update_cache = update_cache && tokens.size() > 0;
-
             if (update_cache) {
                 SRV_WRN("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // don't save the slot's state if its context is empty
+                if (tokens.size() > 0) {
+                    ret->prompt_save(*prompt_cache);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear(false);
@@ -1692,9 +1853,7 @@ private:
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
-                    server_slot * slot = id_slot != -1
-                                            ? get_slot_by_id(id_slot)
-                                            : get_available_slot(task);
+                    server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 
                     //
                     // slot scheduling logic
@@ -1730,6 +1889,14 @@ private:
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
+                    }
+
+                    if (params_base.clear_idle) {
+                        for (auto & s : slots) {
+                            if (!s.is_processing()) {
+                                slot_save_and_clear(s);
+                            }
+                        }
                     }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
@@ -2018,7 +2185,7 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                llama_context_nextn_seq_rm(ctx, slot.id, n_keep, n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 // add generated tokens to cache
@@ -2068,14 +2235,22 @@ private:
             // generate draft tokens in speculative decoding mode
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
             //       perform the speculative drafting for all sequences at the same time in a single batch
-            const int n_draft_max = slot.get_n_draft_max();
-            if (n_draft_max > 0) {
-                if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
-                    GGML_ABORT("not supported by multimodal");
-                }
+            const int n_draft_max_raw = slot.get_n_draft_max();
+            const bool mtmd_safe_spec = slot.spec && common_speculative_all_impls_mtmd_safe(slot.spec);
+            if (mctx && n_draft_max_raw > 0 && !mtmd_safe_spec) {
+                GGML_ABORT("not supported by multimodal");
+            }
 
-                const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+            // NextN/MTP prime requires per-token target hidden states which the mtmd image-decode
+            // path does not produce. Until that is wired in, skip drafting for slots whose prompt
+            // contains image chunks - the slot still works as a normal (non-speculative) decode.
+            const bool skip_draft_mtmd = mctx && slot.prompt.tokens.has_mtmd;
+            const int  n_draft_max     = skip_draft_mtmd ? 0 : n_draft_max_raw;
+
+            if (n_draft_max > 0) {
+                static const llama_tokens k_empty_prompt_tgt;
+                const llama_tokens & cached_text_tokens =
+                        (mctx && mtmd_safe_spec) ? k_empty_prompt_tgt : slot.prompt.tokens.get_text_tokens();
 
                 const auto & params_spec = slot.task->params.speculative;
 
@@ -2110,7 +2285,12 @@ private:
                     slot.drafted = std::move(draft);
                 }
             } else {
-                // no speculative decoding
+                // no speculative decoding for this iteration (e.g. n_remaining == 1 or n_min not satisfied)
+                // drain any in-flight async MTP submitted by the previous iteration's prepare_next,
+                // otherwise the MTP worker would compute concurrently with the upcoming target_decode
+                // on the same backend (race -> Metal command buffer status 3 on turbo3 KV)
+                common_speculative_cancel(slot.spec);
+
                 slot.i_batch = batch.n_tokens;
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2283,7 +2463,7 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            llama_memory_seq_rm (llama_get_memory(ctx), slot.id, head_p, head_c);
+                                            llama_context_nextn_seq_rm(ctx, slot.id, head_p, head_c);
                                             llama_memory_seq_add(llama_get_memory(ctx), slot.id, head_c, head_c + n_match, kv_shift);
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -2374,7 +2554,7 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
-                                            return cur.pos_min < pos_min_thold;
+                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
 
@@ -2450,7 +2630,7 @@ private:
 
                     SLT_INF(slot, "n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                    if (!llama_context_nextn_seq_rm(ctx, slot.id, p0, -1)) {
                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
 
                         slot.prompt_clear(true);
@@ -2482,18 +2662,35 @@ private:
                     // checkpoints are created only if:
                     // - the model uses SWA and we are not using `swa_full`
                     // - the model architecture is marked as recurrent or hybrid
+                    // - sequence removal is full-only or bounded partial (GDN / speculative rollback)
                     //
                     // TODO: try to make this conditional on the context or the memory module, instead of the model type
-                    do_checkpoint = do_checkpoint && (
-                            llama_model_is_recurrent(model) ||
-                            llama_model_is_hybrid(model) ||
-                            (llama_model_n_swa(model) > 0 && !params_base.swa_full)
-                            );
+                    {
+                        const bool n_swa_active = llama_model_n_swa(model) > 0 && !params_base.swa_full;
+                        do_checkpoint = do_checkpoint && (
+                                slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL
+                                || slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED
+                                || n_swa_active
+                                || llama_model_is_recurrent(model)
+                                || llama_model_is_hybrid(model));
+                    }
+
+                    // Qwen NextN draft prime needs pre-norm rows for the WHOLE prompt to
+                    // be present in the target's embd_pre_norm buffer when begin() runs.
+                    // The checkpoint-split logic decodes the last few prompt tokens in a
+                    // separate batch, which would overwrite output_ids of the earlier
+                    // tokens and lose their pre-norm rows. Disable the split for NextN
+                    // slots — the speculative rollback already keeps draft KV consistent
+                    // via llama_context_nextn_seq_rm. Gemma 4 MTP path is unaffected.
+                    if (slot.spec != nullptr &&
+                            slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_NEXTN) {
+                        do_checkpoint = false;
+                    }
 
                     bool has_mtmd = false;
 
                     // check if we should process the image
-                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
                         int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
@@ -2515,6 +2712,14 @@ private:
                         has_mtmd = true;
                     }
 
+                    // Qwen NextN draft prime requires per-token pre-norm hidden states from
+                    // the target, so we must flag every prompt token as an output during
+                    // prefill (logits[i] = true). Gemma 4 MTP keeps its prior semantics
+                    // (last-token output only) and is not affected.
+                    const bool nextn_prefill_all_outputs =
+                            slot.spec != nullptr &&
+                            slot.task->params.speculative.type == COMMON_SPECULATIVE_TYPE_NEXTN;
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
@@ -2531,12 +2736,15 @@ private:
                             break;
                         }
 
-                        // embedding requires all tokens in the batch to be output
+                        // embedding requires all tokens in the batch to be output;
+                        // NextN draft prime also needs per-token outputs (pre-norm h_i).
+                        const bool need_logits =
+                                slot.task->need_embd() || nextn_prefill_all_outputs;
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
                             { slot.id },
-                            slot.task->need_embd());
+                            need_logits);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -2676,7 +2884,24 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx, slot_batched->task->need_embd());
+            // Gemma 4 MTP speculative decoding requires the *target* context to keep
+            // producing hidden states between rounds (the assistant draft consumes the
+            // last target hidden row as part of its input embedding). Without this,
+            // the server would reset embeddings to false for chat/completion tasks and
+            // the draft would always run on a zero h_prev, ruining acceptance rate.
+            //
+            // Qwen NextN does NOT need cparams.embeddings = true on the target:
+            // it consumes per-token PRE-norm hidden states via a separate channel
+            // (llama_set_embeddings_pre_norm + llama_get_embeddings_pre_norm_ith).
+            // Flipping cparams.embeddings on for NextN reroutes the target graph to
+            // emit pooled/embedding outputs in place of vocab logits, which then
+            // corrupts sampling for the very first generated token (and every chain
+            // thereafter).
+            const bool gemma_mtp_active =
+                slot_batched->spec != nullptr &&
+                slot_batched->task->params.speculative.type == COMMON_SPECULATIVE_TYPE_MTP;
+            const bool need_embeddings = slot_batched->task->need_embd() || gemma_mtp_active;
+            llama_set_embeddings(ctx, need_embeddings);
         }
 
         if (batch.n_tokens == 0) {
@@ -2821,7 +3046,15 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                        if (slot.prompt.tokens.has_mtmd) {
+                            // Skip spec begin/prime for mtmd prompts: the per-token target hidden
+                            // states for image positions are not currently produced, which makes
+                            // NextN prime partial and could desync RoPE positions on later drafts.
+                            // The slot will still generate correctly via the non-speculative path.
+                            SLT_INF(slot, "%s", "skipping speculative prime for multimodal prompt\n");
+                        } else {
+                            common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                        }
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -2882,6 +3115,17 @@ private:
 
                 // the accepted tokens from the speculation
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, slot.i_batch_dft, slot.drafted);
+
+                // For MTP speculation, h_prev for the next draft must come from the LAST ACCEPTED
+                // batch output - not embeddings_ith(-1), which would point at a rejected draft's
+                // hidden state (computed for the wrong input). i_batch_dft[ids.size()-1] is the
+                // batch output index of the last accepted token (slot.sampled if no drafts matched,
+                // last accepted draft otherwise).
+                if (!ids.empty() && ids.size() <= slot.i_batch_dft.size()) {
+                    const int last_accepted_batch_idx = (int) slot.i_batch_dft[ids.size() - 1];
+                    common_speculative_set_h_idx(slot.spec, last_accepted_batch_idx);
+                }
+
                 slot.i_batch_dft.clear();
                 slot.drafted.clear();
 
@@ -2901,10 +3145,16 @@ private:
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
 
                 // add accepted tokens to the prompt
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+                // note: use push_back loop instead of insert() so mtmd prompts work too
+                //       (server_tokens::insert asserts !has_mtmd; push_back is mtmd-safe).
+                for (auto it = ids.begin(); it != ids.end() - 1; ++it) {
+                    slot.prompt.tokens.push_back(*it);
+                }
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                llama_context_nextn_seq_rm(ctx, slot.id, slot.prompt.n_tokens(), -1);
+
+                common_speculative_prepare_next(slot.spec, slot.sampled);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
@@ -2919,6 +3169,9 @@ private:
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);
+                        // Drain any pending depth-2 MTP submit before slot.release: the next
+                        // request will seq_rm and overwrite KV cells the worker is still reading.
+                        common_speculative_cancel(slot.spec);
                         slot.release();
 
                         break;
@@ -2948,7 +3201,7 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
-bool server_context::load_model(const common_params & params) {
+bool server_context::load_model(common_params & params) {
     return impl->load_model(params);
 }
 
@@ -3000,6 +3253,8 @@ server_context_meta server_context::get_meta() const {
         /* fim_rep_token          */ llama_vocab_fim_rep(impl->vocab),
         /* fim_sep_token          */ llama_vocab_fim_sep(impl->vocab),
 
+        /* logit_bias_eog         */ impl->params_base.sampling.logit_bias_eog,
+
         /* model_vocab_type       */ llama_vocab_type(impl->vocab),
         /* model_vocab_n_tokens   */ llama_vocab_n_tokens(impl->vocab),
         /* model_n_ctx_train      */ llama_model_n_ctx_train(impl->model),
@@ -3033,6 +3288,9 @@ struct server_res_generator : server_http_res {
     }
 };
 
+void server_context::on_sleeping_changed(std::function<void(bool)> callback) {
+    impl->queue_tasks.on_sleeping_state(std::move(callback));
+}
 
 
 //
@@ -3081,6 +3339,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     ctx_server.vocab,
                     params,
                     meta->slot_n_ctx,
+                    meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
 
@@ -3691,6 +3950,33 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_RESP);
+    };
+
+    this->post_transcriptions_oai = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
+            res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        std::vector<raw_buffer> files;
+        json body = convert_transcriptions_to_chatcmpl(
+            json::parse(req.body),
+            req.files,
+            files);
+        SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
+        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        json body_parsed = oaicompat_chat_params_parse(
+            body,
+            meta->chat_params,
+            files);
+        return handle_completions_impl(
+            req,
+            SERVER_TASK_TYPE_COMPLETION,
+            body_parsed,
+            files,
+            TASK_RESPONSE_TYPE_OAI_ASR);
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
