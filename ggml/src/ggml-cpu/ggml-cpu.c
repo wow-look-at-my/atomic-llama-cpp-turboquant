@@ -2994,6 +2994,10 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = 0;  // no extra workspace needed
                     } break;
+                case GGML_OP_TURBO_WHT:
+                    {
+                        cur = 0;  // no extra workspace needed
+                    } break;
                 case GGML_OP_COUNT:
                     {
                         GGML_ABORT("fatal error");
